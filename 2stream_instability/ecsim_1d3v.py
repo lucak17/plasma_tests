@@ -13,13 +13,22 @@ This version:
 - adds correct diagnostics for electrostatic two-stream: |Ex_k| and Ex-energy
 - (optional) initializes Ex from Gauss/Poisson to satisfy Gauss law at t=0 if desired
 
-Units:
-- Gaussian units in the field solver/energy:
-  Ampere: dE/dt = c curl B - 4π J
-  Energy density: (E^2 + B^2)/(8π)
-
-Author: adapted from your script, with fixes by ChatGPT
-License: MIT
+Units / normalization:
+- "SI-like" normalized (rationalized) units, consistent with `2stream_1d_explicit.py`:
+  epsilon0 = 1, mu0 = 1, c = 1/sqrt(epsilon0*mu0) = 1
+  Gauss: div(E) = rho/epsilon0
+  Magnetic field storage: this code stores B̃ = c * B_SI (so E and B̃ have the same units).
+  Faraday (in terms of stored B̃): dB̃/dt = -c curl E
+  Ampere  (in terms of stored B̃): dE/dt  =  c curl B̃ - J/epsilon0
+  Equivalent SI form (with B_SI):   dE/dt  = c^2 curl B_SI - J/epsilon0
+                                   (1/c^2) dE/dt = curl B_SI - J/(epsilon0*c^2)
+  Energy density (in terms of stored B̃): 0.5*epsilon0*(E^2 + B̃^2)
+  Charge/current deposition on nodes (1D, unit cross-section):
+    rho_g  = Σ_p q_macro W_pg / dx
+    Ĵ_g   = Σ_p q_macro (α_p v_p) W_pg / dx   (ECSIM "hatted" current; α_p from implicit rotation)
+    For B=0: α_p = I  =>  Ĵ_g reduces to the standard PIC current deposit.
+  Macro-particles:
+    weight = n0*Lx/Np, q_macro = q_e0*weight, m_macro = m_e0*weight  =>  (q/m) = q_e0/m_e0.
 """
 
 import numpy as np
@@ -77,9 +86,11 @@ def fit_log_slope(t, y, tmin=None, tmax=None, eps=1e-300):
     return coef[0]
 
 # ------------------------
-# Physical constants (Gaussian units in solver)
+# Physical constants (normalized SI-like / rationalized)
 # ------------------------
-c = 1.0
+epsilon0 = 1.0
+mu0 = 1.0
+c = 1.0 / np.sqrt(epsilon0 * mu0)
 
 # ------------------------
 # Simulation parameters
@@ -105,29 +116,29 @@ print("CFL (c*dt/dx):", c*dt/dx)
 # ------------------------
 moving_s = 1  # only electrons advanced
 
-# We enforce omega_pe = w_pe in Gaussian units via q_e and qm_e and macro-density n0 = Np/Lx
-w_pe   = 1.0          # desired plasma frequency
-qm_e   = -1.0         # q/m (normalized)
+# Match `2stream_1d_explicit.py` normalization:
+#   epsilon0 = 1, m_e0 = 1, q_e0 = -1, n0 = 1  => omega_pe = 1
+m_e0   = 1.0
+q_e0   = -1.0
+n0     = 1.0          # uniform ion background density and mean electron density
+w_pe   = np.sqrt(n0 * (q_e0**2) / (m_e0 * epsilon0))
+qm_e   = q_e0 / m_e0  # q/m
 vt_e   = 0.0          # thermal speed (cold)
 vdrift = 0.2          # beam drift magnitude (beams at ±vdrift)
 
 nppc   = 154
 Np     = nppc * Nx
 
-# Macro-density in 1D (number per unit length in code units)
-n0 = Np / Lx
+# Macro-particle weight and corresponding macro charge/mass
+weight = n0 * Lx / Np
+q_e = q_e0 * weight
+m_e = m_e0 * weight
 
-# Choose per-particle charge q_e so that omega_pe^2 = 4π n0 (q^2/m) = 4π n0 (q*qm)
-# => q = omega_pe^2 / (4π n0 qm)
-q_e = w_pe**2 / (4*np.pi * n0 * qm_e)   # negative since qm_e < 0
-
-# Derived implied mass (for diagnostics): m = q/qm
-m_e = q_e / qm_e
-
-print("=== Normalization check (Gaussian) ===")
-print(f"Nx={Nx}, Lx={Lx:.6g}, dx={dx:.6g}, Np={Np}, n0= Np/Lx = {n0:.6g}")
-print(f"qm_e={qm_e:.6g}, q_e={q_e:.6g}, implied m_e=q/qm={m_e:.6g}")
-omega_check = np.sqrt(4*np.pi * n0 * (q_e * qm_e))
+print("=== Normalization check (epsilon0=mu0=1) ===")
+print(f"Nx={Nx}, Lx={Lx:.6g}, dx={dx:.6g}, Np={Np}, n0={n0:.6g}")
+print(f"macro weight={weight:.6g}, q_macro={q_e:.6g}, m_macro={m_e:.6g}, qm={qm_e:.6g}")
+n_macro = Np / Lx
+omega_check = np.sqrt(n_macro * (q_e * qm_e) / epsilon0)
 print(f"Target omega_pe={w_pe:.6g}, check omega_pe={omega_check:.6g}")
 print("======================================")
 
@@ -305,7 +316,7 @@ def update_velocity_ECSIM(xp, vp, beta_p, B_centers, E_half_nodes):
     return 2.0 * vminus - vp
 
 # ------------------------
-# Optional: initialize Ex from Gauss law (Poisson) in Gaussian units
+# Optional: initialize Ex from Gauss law (periodic)
 # ------------------------
 def deposit_charge_density_nodes(xp, q_s):
     """
@@ -319,9 +330,9 @@ def deposit_charge_density_nodes(xp, q_s):
 
 def solve_Ex_from_rho_gauss(rho_nodes):
     """
-    Periodic Gauss law: dEx/dx = 4π rho.
+    Periodic Gauss law: dEx/dx = rho/epsilon0.
     In Fourier:
-      i k Ex_k = 4π rho_k  => Ex_k = -4π i rho_k / k, for k != 0; Ex_0 = 0.
+      i k Ex_k = rho_k/epsilon0  => Ex_k = -i rho_k/(epsilon0 k), for k != 0; Ex_0 = 0.
     """
     rho0 = rho_nodes - rho_nodes.mean()
     rho_hat = np.fft.fft(rho0)
@@ -329,7 +340,7 @@ def solve_Ex_from_rho_gauss(rho_nodes):
 
     Ex_hat = np.zeros_like(rho_hat, dtype=complex)
     mask = (k != 0.0)
-    Ex_hat[mask] = -4*np.pi * 1j * rho_hat[mask] / k[mask]
+    Ex_hat[mask] = -1j * rho_hat[mask] / (epsilon0 * k[mask])
     Ex = np.fft.ifft(Ex_hat).real
     return Ex
 
@@ -342,11 +353,11 @@ def solve_maxwell_full(E_n_nodes, B_n_centers, J_hat_tot, main_tot, upper_tot,
     Solve for E^{n+theta} (here theta=0.5 -> E_half), then update to E^{n+1}, B^{n+1}.
 
     Operator:
-      [I + (theta c dt)^2 curl curl + 4π theta dt M] E_half = RHS
+      [I + (theta c dt)^2 curl curl + (theta dt/epsilon0) M] E_half = RHS
     RHS:
-      E_n + theta dt c curl B_n - 4π theta dt J_hat
+      E_n + theta dt c curl B_n - (theta dt/epsilon0) J_hat
     """
-    fac_M = 4*np.pi*theta*dt
+    fac_M = theta * dt / epsilon0
     fac_curlcurl = (theta*c*dt)**2
 
     def A_matvec(e_flat):
@@ -495,13 +506,14 @@ for it in range(nsteps):
     # ----------------
     # Diagnostics
     # ----------------
-    # energies (Gaussian): field energy density (E^2+B^2)/(8π)
-    E_energy = dx * np.sum(E[:, :Nx]**2) / (8*np.pi)
-    B_energy = dx * np.sum(B[:, :]**2) / (8*np.pi)
+    # energies (normalized SI-like, consistent with stored B̃ = c*B_SI):
+    # energy density = 0.5*epsilon0*(E^2 + B̃^2)
+    E_energy = 0.5 * epsilon0 * dx * np.sum(E[:, :Nx]**2)
+    B_energy = 0.5 * epsilon0 * dx * np.sum(B[:, :]**2)
     EB_energy = E_energy + B_energy
 
     # electrostatic two-stream should be in Ex primarily
-    Ex_energy = dx * np.sum(E[0, :Nx]**2) / (8*np.pi)
+    Ex_energy = 0.5 * epsilon0 * dx * np.sum(E[0, :Nx]**2)
 
     # kinetic energy: sum 1/2 m v^2
     K_energy = 0.5 * m_e * np.sum(v_e**2)
